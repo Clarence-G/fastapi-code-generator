@@ -366,16 +366,20 @@ class OpenAPIParser(OpenAPIModelParser):
             required=parameters.required or parameters.in_ == ParameterLocation.path,
         )
 
-        if orig_name != name:
-            if parameters.in_:
-                param_is = parameters.in_.value.lower().capitalize()
-                self.imports_for_fastapi.append(
-                    Import(from_='fastapi', import_=param_is)
-                )
-                default: Optional[str] = (
-                    f"{param_is}({'...' if field.required else repr(schema.default)}, alias='{orig_name}')"
-                )
+        default: Optional[str] = None
+        if parameters.in_:
+            param_is = parameters.in_.value.lower().capitalize()
+            self.imports_for_fastapi.append(
+                Import(from_='fastapi', import_=param_is)
+            )
+            if orig_name != name:
+                # Use alias when parameter name differs from field name
+                default = f"{param_is}({'...' if field.required else repr(schema.default)}, alias='{orig_name}')"
+            else:
+                # Use FastAPI parameter annotation even when names match
+                default = f"{param_is}({'...' if field.required else repr(schema.default)})"
         else:
+            # Fallback for parameters without location info
             default = repr(schema.default) if schema.has_default else None
         self.imports_for_fastapi.append(field.imports)
         self.data_types.append(field.data_type)
