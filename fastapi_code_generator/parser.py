@@ -265,6 +265,7 @@ class OpenAPIParser(OpenAPIModelParser):
         custom_class_name_generator: Optional[Callable[[str], str]] = None,
         field_extra_keys: Optional[Set[str]] = None,
         field_include_all_keys: bool = False,
+        schema_replacements: Optional[Dict[str, str]] = None,
     ):
         super().__init__(
             source=source,
@@ -309,6 +310,174 @@ class OpenAPIParser(OpenAPIModelParser):
         self._temporary_operation: Dict[str, Any] = {}
         self.imports_for_fastapi: Imports = Imports()
         self.data_types: List[DataType] = []
+        self.schema_replacements: Dict[str, str] = schema_replacements or {}
+
+    def should_replace_schema(self, schema_name: str) -> Optional[str]:
+        """检查schema是否需要替换，返回替换的导入路径"""
+        return self.schema_replacements.get(schema_name)
+
+    def create_replacement_data_type(self, schema_name: str, import_path: str) -> DataType:
+        """为替换的schema创建DataType"""
+        # 添加导入语句
+        self.imports.append(Import.from_full_path(import_path))
+        
+        # 创建DataType，使用schema名称作为type_hint
+        return DataType(
+            type=schema_name,
+            import_=Import.from_full_path(import_path),
+        )
+
+    def get_ref_data_type(self, ref: str) -> DataType:
+        """重写父类方法以支持schema替换"""
+        # 从引用路径中提取schema名称
+        # 例如: "#/components/schemas/User" -> "User"
+        if ref.startswith('#/components/schemas/'):
+            schema_name = ref.split('/')[-1]
+            replacement_path = self.should_replace_schema(schema_name)
+            if replacement_path:
+                return self.create_replacement_data_type(schema_name, replacement_path)
+        
+        # 如果不需要替换，调用父类方法
+        return super().get_ref_data_type(ref)
+
+    def parse_schema(self, name: str, schema: JsonSchemaObject, path: List[str]) -> DataType:
+        """重写父类方法以支持schema替换"""
+        # 检查当前解析的schema是否需要替换
+        replacement_path = self.should_replace_schema(name)
+        if replacement_path:
+            return self.create_replacement_data_type(name, replacement_path)
+        
+        # 如果不需要替换，调用父类方法
+        return super().parse_schema(name, schema, path)
+
+    def parse(self) -> Union[str, Dict[Tuple[str, ...], DataModel]]:
+        """重写父类方法以过滤被替换的schema"""
+        # 调用父类的parse方法
+        result = super().parse()
+        
+
+        
+        # 如果有schema替换配置，需要从结果中移除被替换的模型
+        if self.schema_replacements and isinstance(result, dict):
+            filtered_result = {}
+            for key, model in result.items():
+                # key是tuple，通常最后一个元素是模型名
+                model_name = key[-1] if key else ""
+                print(f"Debug: 检查模型 {model_name}, key={key}")  # 调试信息
+                if model_name not in self.schema_replacements:
+                    filtered_result[key] = model
+                else:
+                    print(f"Debug: 跳过被替换的模型 {model_name}")  # 调试信息
+            return filtered_result
+        elif self.schema_replacements and isinstance(result, str):
+            # 如果结果是字符串，我们需要过滤掉被替换的类定义和相关导入
+            lines = result.split('\n')
+            filtered_lines = []
+            skip_class = False
+            current_class = None
+            needed_imports = set()
+            
+            # 首先扫描所有行，找出需要的导入
+            for line in lines:
+                for schema_name in self.schema_replacements:
+                    # 检查是否有类继承了被替换的schema，或者在类型注解中使用了它
+                    if (f'({schema_name})' in line or  # 继承
+                        f': {schema_name}' in line or  # 类型注解
+                        f'[{schema_name}]' in line or  # 泛型类型
+                        f'Optional[{schema_name}]' in line or
+                        f'List[{schema_name}]' in line):
+                        needed_imports.add(schema_name)
+            
+            # 按模块分组需要的导入
+            imports_by_module = {}
+            for schema_name in needed_imports:
+                import_path = self.schema_replacements[schema_name]
+                if '.' in import_path:
+                    module_path = import_path.rsplit('.', 1)[0]
+                    if module_path not in imports_by_module:
+                        imports_by_module[module_path] = []
+                    imports_by_module[module_path].append(schema_name)
+                else:
+                    # 对于直接import的情况
+                    if import_path not in imports_by_module:
+                        imports_by_module[import_path] = []
+                    imports_by_module[import_path].append(schema_name)
+            
+            # 添加需要的导入语句
+            import_section_added = False
+            future_import_found = False
+            for line in lines:
+                # 先添加当前行
+                should_add_line = True
+                
+                # 检查是否是future import
+                if line.strip().startswith('from __future__'):
+                    future_import_found = True
+                
+                # 在合适的位置添加被替换schema的导入
+                if (not import_section_added and 
+                    future_import_found and 
+                    line.strip().startswith('from ') and 
+                    'import' in line and 
+                    not line.strip().startswith('from __future__')):
+                    # 找到导入区域（在future import之后），添加我们需要的导入
+                    for module_path, schema_names in imports_by_module.items():
+                        if '.' in module_path or module_path in self.schema_replacements.values():
+                            # from module import name1, name2
+                            imports_str = ', '.join(sorted(schema_names))
+                            filtered_lines.append(f'from {module_path} import {imports_str}')
+                        else:
+                            # import module
+                            for schema_name in schema_names:
+                                filtered_lines.append(f'import {module_path}')
+                    import_section_added = True
+                
+                # 检查是否是导入被替换schema的重复语句（避免重复导入）
+                is_replacement_import = False
+                for schema_name, import_path in self.schema_replacements.items():
+                    # 检查各种可能的导入格式
+                    if (f'from {import_path.rsplit(".", 1)[0]} import {schema_name}' in line or
+                        f'import {import_path}' in line or
+                        (f'import {schema_name}' in line and import_path in line)):
+                        is_replacement_import = True
+                        break
+                
+                if is_replacement_import:
+                    should_add_line = False
+                
+                # 检查是否是类定义开始
+                if line.strip().startswith('class ') and ':' in line:
+                    class_name = line.strip().split('class ')[1].split('(')[0].strip()
+                    current_class = class_name
+                    
+                    # 检查是否是被替换的schema类（包括可能的重命名）
+                    should_skip_class = False
+                    for schema_name in self.schema_replacements:
+                        # 直接匹配或者匹配带Model后缀的情况
+                        if (class_name == schema_name or 
+                            class_name == f"{schema_name}Model" or
+                            class_name.startswith(f"{schema_name}Model")):
+                            should_skip_class = True
+                            break
+                    
+                    if should_skip_class:
+                        skip_class = True
+                        continue
+                    else:
+                        skip_class = False
+                
+                # 如果不在跳过的类中，或者遇到了新的类定义，添加这一行
+                if not skip_class and should_add_line:
+                    filtered_lines.append(line)
+                elif line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+                    # 遇到新的顶级定义，停止跳过
+                    skip_class = False
+                    if should_add_line:
+                        filtered_lines.append(line)
+            
+            return '\n'.join(filtered_lines)
+        
+        return result
 
     def parse_info(self) -> Optional[Dict[str, Any]]:
         result = self.raw_obj.get('info', {}).copy()

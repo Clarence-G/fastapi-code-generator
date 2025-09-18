@@ -65,6 +65,7 @@ def main(
     python_version: PythonVersion = typer.Option(
         PythonVersion.PY_39.value, "--python-version", "-p"
     ),
+    schema_replacements: Optional[str] = typer.Option(None, "--schema-replacements"),
 ) -> None:
     input_name: str = input_file
     input_text: str
@@ -73,6 +74,16 @@ def main(
         input_text = f.read()
 
     model_path = Path(model_file) if model_file else MODEL_PATH  # pragma: no cover
+
+    # 解析schema_replacements JSON字符串
+    parsed_schema_replacements = None
+    if schema_replacements:
+        import json
+        try:
+            parsed_schema_replacements = json.loads(schema_replacements)
+        except json.JSONDecodeError as e:
+            typer.echo(f"Error parsing schema-replacements JSON: {e}", err=True)
+            raise typer.Exit(1)
 
     return generate_code(
         input_name,
@@ -89,6 +100,7 @@ def main(
         specify_tags=specify_tags,
         output_model_type=output_model_type,
         python_version=python_version,
+        schema_replacements=parsed_schema_replacements,
     )
 
 
@@ -117,6 +129,7 @@ def generate_code(
     specify_tags: Optional[str] = None,
     output_model_type: DataModelType = DataModelType.PydanticBaseModel,
     python_version: PythonVersion = PythonVersion.PY_39,
+    schema_replacements: Optional[Dict[str, str]] = None,
 ) -> None:
     if not model_path:
         model_path = MODEL_PATH
@@ -142,6 +155,7 @@ def generate_code(
         dump_resolve_reference_action=data_model_types.dump_resolve_reference_action,
         custom_template_dir=model_template_dir,
         target_python_version=python_version,
+        schema_replacements=schema_replacements,
     )
 
     with chdir(output_dir):
@@ -271,4 +285,4 @@ def generate_code(
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    app()
